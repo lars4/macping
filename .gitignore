@@ -1,0 +1,7 @@
+.DS_Store
+*.app/
+config
+err.log
+msg_ids
+samples
+samples.tmp
