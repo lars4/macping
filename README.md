@@ -25,6 +25,7 @@ Bot:    📍 Location via Wi-Fi (±35 m)
 
 - **Status on demand** – send any message to get power source, battery level and charging state, mean CPU and RAM usage over the last 10 minutes, uptime and local time.
 - **Location on demand** – `/location` returns a map pin. Uses CoreLocation (Wi-Fi positioning, typically 10–50 m) and falls back to IP geolocation (city level).
+- **Watch mode** – `/watch` sends an "alive" ping with the full status every 5 minutes and an immediate alert the moment the charger is unplugged (and when it is plugged in again). `/stop` ends it. The mode survives restarts of the agent.
 - **Tidy chat** – previous replies and your request are deleted automatically, so the chat only ever shows the latest answer.
 - **Private** – only reacts to messages from your own chat ID; everything else is ignored.
 - **Zero dependencies** – uses only tools that ship with macOS (`bash`, `curl`, `pmset`, `launchctl`). The Xcode Command Line Tools are needed only for the optional precise location.
@@ -64,6 +65,8 @@ Bot:    📍 Location via Wi-Fi (±35 m)
 | --- | --- |
 | anything (e.g. `status`) | Online/power/battery/uptime status |
 | `/location` | Location link and map pin |
+| `/watch` | Start watch mode: status every 5 min, instant alert on unplug |
+| `/stop` | End watch mode |
 
 No reply means the Mac is off, asleep or offline.
 
@@ -86,6 +89,7 @@ Files live in `~/.macping/`:
 | `macping.sh` | the agent script |
 | `MacPingLoc.app` | small Swift helper, ad-hoc signed, runs on demand |
 | `msg_ids` | IDs of recent bot messages, used for cleanup |
+| `watch` | empty flag file, present while watch mode is on |
 | `samples` | CPU/RAM samples (every 30 s, last 10 min) for the rolling average |
 | `err.log` | stderr of the agent |
 
