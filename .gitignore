@@ -6,3 +6,9 @@ msg_ids
 samples
 samples.tmp
 watch
+alarm
+alarm.vol
+beat
+alarm.audio
+audio-out
+audio-out-build.log

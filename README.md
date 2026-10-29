@@ -25,10 +25,11 @@ Bot:    📍 Location via Wi-Fi (±35 m)
 
 - **Status on demand** – send any message to get power source, battery level and charging state, mean CPU and RAM usage over the last 10 minutes, uptime and local time.
 - **Location on demand** – `/location` returns a map pin. Uses CoreLocation (Wi-Fi positioning, typically 10–50 m) and falls back to IP geolocation (city level).
-- **Watch mode** – `/watch` sends an "alive" ping with the full status every 5 minutes and an immediate alert the moment the charger is unplugged (and when it is plugged in again). `/stop` ends it. The mode survives restarts of the agent.
+- **Watch mode** – `/watch` sends an "alive" ping with the full status every 5 minutes and an alert within about a second of the charger being unplugged (and when it is plugged in again; checked every `POLL` seconds). `/stop` ends it. The mode survives restarts of the agent.
+- **Theft alarm** – in watch mode, unplugging the charger also starts a persistent alarm sound whose volume rises step by step (10 % for 30 s, then 20 %, 30 % … up to a cap). It stops automatically when power is back, or at any time with `/stop`. The alarm always rings through the **built-in speakers**, even if (Bluetooth or wired) headphones are connected; your previous output device and volume are restored afterwards.
 - **Tidy chat** – previous replies and your request are deleted automatically, so the chat only ever shows the latest answer.
 - **Private** – only reacts to messages from your own chat ID; everything else is ignored.
-- **Zero dependencies** – uses only tools that ship with macOS (`bash`, `curl`, `pmset`, `launchctl`). The Xcode Command Line Tools are needed only for the optional precise location.
+- **Zero dependencies** – uses only tools that ship with macOS (`bash`, `curl`, `pmset`, `launchctl`). The Xcode Command Line Tools are needed only for the optional helpers (precise location, forcing the built-in speakers).
 
 ## Requirements
 
@@ -65,8 +66,8 @@ Bot:    📍 Location via Wi-Fi (±35 m)
 | --- | --- |
 | anything (e.g. `status`) | Online/power/battery/uptime status |
 | `/location` | Location link and map pin |
-| `/watch` | Start watch mode: status every 5 min, instant alert on unplug |
-| `/stop` | End watch mode |
+| `/watch` | Start watch mode: status every 5 min, instant alert and rising alarm on unplug |
+| `/stop` | End watch mode and silence the alarm |
 
 No reply means the Mac is off, asleep or offline.
 
@@ -88,8 +89,11 @@ Files live in `~/.macping/`:
 | `config` | `BOT_TOKEN` and `CHAT_ID` (mode 600) |
 | `macping.sh` | the agent script |
 | `MacPingLoc.app` | small Swift helper, ad-hoc signed, runs on demand |
+| `audio-out` | small C helper (CoreAudio) that switches the output to the built-in speakers during the alarm |
 | `msg_ids` | IDs of recent bot messages, used for cleanup |
 | `watch` | empty flag file, present while watch mode is on |
+| `beat` | time of the last watch-mode message, drives the 5-minute ping |
+| `alarm`, `alarm.vol`, `alarm.audio` | present only while the alarm rings (loop PID, your volume and output device to restore) |
 | `samples` | CPU/RAM samples (every 30 s, last 10 min) for the rolling average |
 | `err.log` | stderr of the agent |
 
@@ -100,6 +104,7 @@ The LaunchAgent is `~/Library/LaunchAgents/com.macping.agent.plist`.
 - **One consumer per bot.** Telegram delivers updates to a single poller or webhook. If another program already polls the same bot (or a webhook is set), macping and that program will conflict. Use a separate bot for macping.
 - **Sleeping Macs don't answer.** A closed MacBook on power normally sleeps. To stay reachable while plugged in, use a clamshell setup or `sudo pmset -c sleep 0`.
 - **Starts at login.** LaunchAgents run in a user session, so the Mac must be logged in after a reboot (consider enabling automatic login).
+- **The alarm only rings while the Mac is awake.** It rises 10 % every 30 s up to 100 %. It uses the built-in speakers only if the `audio-out` helper was built (needs the Command Line Tools); without it, it plays through whatever output is active. Forcing the speakers while a wired headset is plugged in works on Macs that expose the "Internal Speakers" data source, which is best effort. Adjust `ALARM_START`, `ALARM_STEP`, `ALARM_STEP_SECONDS`, `ALARM_MAX` and `ALARM_SOUND` at the top of `macping.sh`.
 - **Message cleanup is limited to 48 hours** by Telegram. Older messages are left alone.
 - **IP geolocation is coarse** and shows the VPN exit if a VPN is active.
 - macOS has no GPS; precise location comes from Wi-Fi positioning and needs nearby Wi-Fi networks.

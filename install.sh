@@ -70,6 +70,21 @@ else
   echo "(Install them with 'xcode-select --install' and re-run this script for precise location.)"
 fi
 
+# ---- Audio helper (optional): lets the alarm use the built-in speakers --------
+if xcode-select -p >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
+  if cc -O2 -o "$DIR/audio-out" "$SRC/audio-out.c" \
+        -framework CoreAudio -framework CoreFoundation 2>"$DIR/audio-out-build.log"; then
+    rm -f "$DIR/audio-out-build.log"
+    echo "Audio helper built: the alarm will always use the built-in speakers."
+  else
+    echo "Could not build the audio helper (see $DIR/audio-out-build.log)." >&2
+    echo "The alarm will play through whatever output device is active." >&2
+  fi
+else
+  echo "No C compiler found: the alarm will play through the active output device."
+  echo "(Install the Command Line Tools and re-run this script to force the built-in speakers.)"
+fi
+
 # ---- LaunchAgent ------------------------------------------------------------
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -88,7 +103,16 @@ cat > "$PLIST" <<EOF
 EOF
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# bootout can return before the old process has exited, and bootstrapping too
+# early fails with "Input/output error": wait until the old agent is gone.
+for _ in $(seq 1 30); do
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+  sleep 1
+done
+launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || {
+  sleep 3
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+}
 
 echo
 echo "macping is running. You should receive a status message in Telegram."

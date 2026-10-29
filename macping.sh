@@ -16,6 +16,19 @@ WINDOW=600               # averaging window in seconds (10 min)
 INTERVAL=30              # sampling interval in seconds
 WATCH_FILE="$DIR/watch"  # exists while watch mode is on
 WATCH_INTERVAL=300       # watch-mode ping interval in seconds (5 min)
+BEAT_FILE="$DIR/beat"    # epoch of the last watch-mode message
+POLL=1                   # how often (seconds) the power source is checked
+
+# Alarm (rings while unplugged in watch mode; volume rises step by step)
+ALARM_FLAG="$DIR/alarm"          # exists while the alarm runs (holds the loop's PID)
+ALARM_VOL_SAVE="$DIR/alarm.vol"  # your volume/mute state, restored afterwards
+ALARM_SOUND="${ALARM_SOUND:-/System/Library/Sounds/Sosumi.aiff}"
+AUDIO_OUT="$DIR/audio-out"            # CoreAudio helper: forces the built-in speakers
+ALARM_AUDIO_SAVE="$DIR/alarm.audio"   # previous output device, restored afterwards
+ALARM_START=10                   # volume (%) during the first step
+ALARM_STEP=10                    # volume increase (%) per step
+ALARM_STEP_SECONDS=30            # length of one step in seconds
+ALARM_MAX=100                    # volume cap (%)
 
 # shellcheck source=/dev/null
 source "$CONFIG" || { echo "macping: cannot read $CONFIG" >&2; exit 1; }
@@ -114,11 +127,89 @@ usage_avg() {
     }' "$SAMPLES"
 }
 
+set_volume() { osascript -e "set volume output volume $1 without output muted" >/dev/null 2>&1; }
+
+alarm_running() {
+  [ -f "$ALARM_FLAG" ] && kill -0 "$(cat "$ALARM_FLAG" 2>/dev/null)" 2>/dev/null
+}
+
+# Start the alarm: 10 % for 30 s, then 20 % for 30 s, 30 % ... up to ALARM_MAX.
+# It always rings through the built-in speakers (if the audio-out helper exists),
+# even when headphones are connected.
+alarm_on() {
+  local owner=$$ builtin="" orig=""
+  alarm_running && return 0
+  if [ -x "$AUDIO_OUT" ]; then
+    builtin=$("$AUDIO_OUT" builtin 2>/dev/null)
+    if [ -n "$builtin" ]; then
+      orig=$("$AUDIO_OUT" get 2>/dev/null)
+      echo "$orig $builtin $("$AUDIO_OUT" source "$builtin" 2>/dev/null)" > "$ALARM_AUDIO_SAVE"
+      "$AUDIO_OUT" set "$builtin" 2>/dev/null
+      "$AUDIO_OUT" source "$builtin" ispk 2>/dev/null   # speakers, not the headphone jack
+    fi
+  fi
+  # Remember the current volume/mute state so alarm_off can restore it.
+  osascript -e 'set v to get volume settings' \
+            -e 'return (output volume of v as text) & " " & (output muted of v as text)' \
+            > "$ALARM_VOL_SAVE" 2>/dev/null
+  : > "$ALARM_FLAG"
+  (
+    t0=$(date +%s)
+    # Ends when the flag is removed or the agent itself is gone.
+    while [ -f "$ALARM_FLAG" ] && kill -0 "$owner" 2>/dev/null; do
+      lvl=$(( ALARM_START + ALARM_STEP * ( ( $(date +%s) - t0 ) / ALARM_STEP_SECONDS ) ))
+      [ "$lvl" -gt "$ALARM_MAX" ] && lvl=$ALARM_MAX
+      if [ -n "$builtin" ]; then   # win back the output if headphones reconnect
+        "$AUDIO_OUT" set "$builtin" 2>/dev/null
+        "$AUDIO_OUT" source "$builtin" ispk 2>/dev/null
+      fi
+      set_volume "$lvl"
+      afplay "$ALARM_SOUND" 2>/dev/null || sleep 1
+    done
+  ) &
+  echo $! > "$ALARM_FLAG"
+}
+
+# Stop the alarm (if any) and restore the previous volume. Safe to call anytime.
+alarm_off() {
+  local pid vol muted
+  if [ -f "$ALARM_FLAG" ]; then
+    pid=$(cat "$ALARM_FLAG" 2>/dev/null)
+    rm -f "$ALARM_FLAG"
+    if [ -n "$pid" ]; then
+      pkill -P "$pid" 2>/dev/null
+      kill "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+    fi
+  fi
+  if [ -f "$ALARM_VOL_SAVE" ]; then
+    read -r vol muted < "$ALARM_VOL_SAVE"
+    case "$vol" in
+      ''|*[!0-9]*) ;;
+      *) set_volume "$vol" ;;
+    esac
+    [ "$muted" = "true" ] && osascript -e 'set volume with output muted' >/dev/null 2>&1
+    rm -f "$ALARM_VOL_SAVE"
+  fi
+  # Give the output back to the headphones / previous device.
+  if [ -f "$ALARM_AUDIO_SAVE" ]; then
+    local orig builtin src
+    read -r orig builtin src < "$ALARM_AUDIO_SAVE"
+    if [ -x "$AUDIO_OUT" ]; then
+      [ -n "$src" ] && "$AUDIO_OUT" source "$builtin" "$src" 2>/dev/null
+      [ -n "$orig" ] && "$AUDIO_OUT" set "$orig" 2>/dev/null
+    fi
+    rm -f "$ALARM_AUDIO_SAVE"
+  fi
+  return 0
+}
+
 # -------------------------------------------------------------- Watch mode --
 #
 # /watch  -> alive ping every WATCH_INTERVAL seconds + instant alert when the
-#            charger is unplugged. /stop ends it. Every new message replaces the
-#            previous ones. The mode survives an agent restart (flag file).
+#            charger is unplugged. While unplugged an alarm rings with rising
+#            volume until you plug in again or send /stop. Every new message
+#            replaces the previous ones. The mode survives an agent restart.
 
 power_src() { pmset -g batt | head -1 | sed -E "s/.*'(.*)'.*/\1/"; }
 
@@ -130,33 +221,44 @@ replace_with() { cleanup; send "$1"; }
 
 watch_on() {
   : > "$WATCH_FILE"
-  LAST_SRC=$(power_src)
-  LAST_BEAT=$(date +%s)
+  date +%s > "$BEAT_FILE"
   replace_with "$(watch_msg "👁 Watch mode ON – ping every $((WATCH_INTERVAL / 60)) min, instant alert if unplugged. Stop with /stop")"
 }
 
 watch_off() {
   rm -f "$WATCH_FILE"
+  alarm_off
   replace_with "$(watch_msg '👁 Watch mode OFF')"
 }
 
-# Called on every loop iteration (at least every ~30 s).
+# Runs every POLL seconds in the background watcher (see Main), independent of
+# the Telegram long-poll, so plug/unplug is noticed within about a second.
 watch_tick() {
-  local now src
+  local now src beat
   now=$(date +%s)
   src=$(power_src)
+  [ -n "$src" ] || return 0   # pmset hiccup: ignore this tick
+  beat=$(cat "$BEAT_FILE" 2>/dev/null); beat=${beat:-$now}
   if [ -f "$WATCH_FILE" ]; then
     if [ "$src" != "$LAST_SRC" ]; then
       if [ "$src" = "AC Power" ]; then
-        replace_with "$(watch_msg '🔌 Plugged in again')"
+        alarm_off
+        replace_with "$(watch_msg '🔌 Plugged in again – alarm silenced')"
       else
-        replace_with "$(watch_msg '🚨 ALERT: Mac was UNPLUGGED – now on battery!')"
+        alarm_on
+        replace_with "$(watch_msg '🚨 ALERT: Mac was UNPLUGGED – now on battery! 🔊 Alarm ringing (volume rises). Plug in or /stop to silence.')"
       fi
-      LAST_BEAT=$now
-    elif [ $(( now - LAST_BEAT )) -ge "$WATCH_INTERVAL" ]; then
-      replace_with "$(watch_msg '💓 Still alive')"
-      LAST_BEAT=$now
+      date +%s > "$BEAT_FILE"
+    elif [ $(( now - beat )) -ge "$WATCH_INTERVAL" ]; then
+      date +%s > "$BEAT_FILE"
+      if alarm_running; then
+        replace_with "$(watch_msg '🚨 Still on battery – 🔊 alarm ringing')"
+      else
+        replace_with "$(watch_msg '💓 Still alive')"
+      fi
     fi
+  else
+    alarm_off   # alarm never outlives watch mode
   fi
   LAST_SRC=$src
 }
@@ -211,7 +313,7 @@ PARENT=$$
 sample
 ( while kill -0 "$PARENT" 2>/dev/null; do sleep "$INTERVAL"; sample; done ) &
 SAMPLER=$!
-trap 'kill "$SAMPLER" 2>/dev/null' EXIT
+trap 'kill "$SAMPLER" "$WATCHER" 2>/dev/null; alarm_off' EXIT
 trap 'exit 0' TERM INT
 
 # Skip updates that arrived while we were not running.
@@ -219,16 +321,26 @@ offset=$(curl -s --max-time 15 "$API/getUpdates?offset=-1" | grep -o '"update_id
 offset=$(( ${offset:-0} + 1 ))
 
 cleanup
+alarm_off   # clear leftovers of a previous run and restore the volume
 LAST_SRC=$(power_src)
-LAST_BEAT=$(date +%s)
+date +%s > "$BEAT_FILE"
 if [ -f "$WATCH_FILE" ]; then
-  send "$(watch_msg '👁 Watch mode active (restarted)')"
+  if [ "$LAST_SRC" != "AC Power" ]; then
+    alarm_on
+    send "$(watch_msg '🚨 Watch mode active (restarted) – Mac is on battery! 🔊 Alarm ringing. Plug in or /stop to silence.')"
+  else
+    send "$(watch_msg '👁 Watch mode active (restarted)')"
+  fi
 else
   send "$(status)"
 fi
 
+# Background watcher: power checks every POLL s (heartbeat, unplug alert, alarm).
+# It keeps its own LAST_SRC; it ends together with this script.
+( while kill -0 "$PARENT" 2>/dev/null; do watch_tick; sleep "$POLL"; done ) &
+WATCHER=$!
+
 while true; do
-  watch_tick
   resp=$(curl -s --max-time 40 "$API/getUpdates?timeout=30&offset=${offset}")
   if [ -z "$resp" ]; then sleep 10; continue; fi
   last=$(echo "$resp" | grep -o '"update_id":[0-9]*' | tail -1 | cut -d: -f2)
